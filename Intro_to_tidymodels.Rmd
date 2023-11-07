@@ -1,0 +1,168 @@
+---
+title: "Intro_to_tidymodels"
+author: "Caitlin Nordheim"
+date: "2023-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+### Packages you may need to install: tidymodels, ranger (for random forest)
+library(tidyverse)
+library(here)
+library(ranger)
+
+### a metapackage like tidyverse, tidymodels contains many model-relevant 
+### packages incl rsample, parsnip, recipes, yardstick, broom - we don't 
+### need to worry about the differences here...
+library(tidymodels) 
+
+```
+
+
+# Basic model selection with cross validation on a basic regression task
+
+```{r load data and quick vis}
+data(diamonds)
+head(diamonds)
+
+ggplot(data=diamonds, aes(x = carat, y = price, color=color, shape=cut)) +
+  geom_point() +
+  theme_minimal()
+```
+
+```{r manual cross validation}
+set.seed(42)
+
+# using 90% of the dataset to train then testing on the remaining 10
+# we do this to avoid overfitting
+diamonds_10fold <- diamonds %>% ### dataset built into ggplot package, see data()
+  mutate(fold = rep(1:10, length.out = n()),
+         fold = sample(fold, size = n(), replace = FALSE))
+
+diamonds_validate <- diamonds_10fold %>%
+  filter(fold == 1)
+diamonds_train <- diamonds_10fold %>%
+  filter(fold !=1)
+
+### train on the training partition
+mdl1 <- lm(price ~ carat + cut + color, data = diamonds_train)
+mdl2 <- lm(price ~ carat +color + clarity, data = diamonds_train)
+mdl3 <- lm(price ~ carat + cut+ color + clarity, data = diamonds_train)
+
+### test/validate on the validation partition
+test_df <- diamonds_validate %>%
+  mutate(pred1 = predict(mdl1, diamonds_validate),
+         pred2 = predict(mdl2, .), # . is saying the stuff you already know
+         pred3 = predict(mdl3, .)) %>%
+  ## calculate resids of each prediction
+  mutate(resid1 = pred1 - price,
+         resid2 = pred2 - price,
+         resid3 = pred3 - price,
+         )
+
+### write a function for root means square error
+calc_rmse <- function(x) {
+  ### x is a vector - square all elements, take mean, then square-root the mean
+  sq_error <- x^2 
+  mean_sq_error <- mean(sq_error)
+  rt_mean_sq_error <- sqrt(mean_sq_error)
+  
+  return(rt_mean_sq_error)
+}
+
+### compare test results
+# feed it a column from the dataframe!
+calc_rmse(test_df$resid1) 
+calc_rmse(test_df$resid2) 
+calc_rmse(test_df$resid3) #best one :) 
+
+```
+
+# Tidy models with a classifier task
+Categorical var instead of numeric var being predicted
+
+```{r}
+t_df <- read_csv(here('data/titanic_survival.csv'))
+
+surv_df <- t_df %>%
+  # set survived, passenger class as a factor
+  mutate(survived = factor(survived),
+         pclass = factor(pclass)) %>%
+  # drop columns
+  select(-cabin, -ticket)
+
+ggplot(surv_df, aes(x = pclass, fill = survived)) +
+  geom_bar()
+
+ggplot(surv_df, aes(x = age, fill = survived)) +
+  geom_histogram()
+```
+
+## Using `tidymodels`
+
+### split data
+```{r}
+surv_df %>% 
+  group_by(survived) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(prop = n / sum(n))
+
+set.seed(123)
+#strata: make sure good proportion of both in dataset
+surv_split <- initial_split(surv_df, prop = 0.8, strata = survived) 
+
+surv_train_df <- training(surv_split)
+surv_test_df <- testing(surv_split)
+```
+
+## `tidymodels` basic model with `parsnip`
+
+blr: binary logistic regression
+
+```{r}
+blr_mdl <- logistic_reg() %>%
+  set_engine('glm')
+
+blr_fit <- blr_mdl %>%
+  fit(survived ~ sex + pclass, data=surv_train_df)
+
+### let's create a poor predictor aka gargabe model
+garbage_fit <- blr_mdl %>%
+  fit(survived ~ passenger_id + embarked, data=surv_train_df)
+```
+
+```{r}
+surv_test_predict <- surv_test_df %>%
+  mutate(predict(blr_fit, new_data = surv_test_df)) %>%
+  mutate(predict(blr_fit, new_data = ., type = 'prob'))
+
+# confusion matrix, how many times did it predict one thing but it was right or wrong
+table(surv_test_predict %>% select (survived, .pred_class))
+
+# accuracy function
+accuracy(surv_test_predict, truth = survived, estimate = .pred_class) # 81% accuracy
+```
+
+```{r}
+## area under ROC curve tells us how good our model is at predicting
+
+roc_df <- roc_curve(surv_test_predict, truth = survived, .pred_0)
+autoplot(roc_df)
+
+### how about our garbage model?
+garbage_test_df <- surv_test_df %>%
+  mutate(predict(garbage_fit, new_data = ., type = 'prob')) 
+
+garbage_roc_df <- garbage_test_df %>%
+  roc_curve(truth = survived, .pred_0) 
+
+autoplot(garbage_roc_df)
+
+#auc area under curve
+roc_auc(surv_test_predict, truth = survived, .pred_0)
+roc_auc(garbage_test_df, truth = survived, .pred_0)
+```
